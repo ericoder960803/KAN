@@ -1,19 +1,27 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-import torchvision
-import torchvision.transforms as transforms
-from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
-import numpy as np
-import os
-from training_module import train_with_val_safe
-import matplotlib.pyplot as plt
-from tqdm.notebook import tqdm
-import timm
+from datasets import load_dataset
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoTokenizer
+import gc
+class BaselineTransformer(nn.Module):
+    def __init__(self, vocab_size, d_model=128, nhead=8, num_layers=4, seq_len=128):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.pos_encoding = nn.Parameter(torch.zeros(1, seq_len, d_model))
+        
+        # 標準 Transformer 層
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=d_model*4, batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        self.head = nn.Linear(d_model, vocab_size)
 
-
+    def forward(self, x):
+        b, l = x.shape
+        x = self.embedding(x) + self.pos_encoding[:, :l, :]
+        x = self.transformer(x)
+        return self.head(x)
 
 class TaylorLinear(nn.Module):
     def __init__(self, in_f, out_f, order=3):
@@ -62,91 +70,227 @@ class AdaptiveHybridKANLayer(nn.Module):
         return a * t + (1 - a) * s
 
 
-
-class KANGlobalPyramidInteraction(nn.Module):
-    def __init__(self, d_model):
+class MemoryEfficientHybridBlock(nn.Module):
+    def __init__(self, d_model, nhead=8, dropout=0.1, use_checkpoint=True):
         super().__init__()
-        self.interaction_kan = AdaptiveHybridKANLayer(d_model * 2, d_model)
-        self.scale_fusion = nn.Sequential(nn.Linear(21 * d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
-        self.norm = nn.LayerNorm(d_model)
-    def forward(self, x):
-        B, L, D = x.shape
-        H = W = int(L**0.5)
-        x_2d = x.transpose(1, 2).reshape(B, D, H, W)
-        p1 = F.adaptive_avg_pool2d(x_2d, (1, 1)).reshape(B, -1)
-        p2 = F.adaptive_avg_pool2d(x_2d, (2, 2)).reshape(B, -1)
-        p3 = F.adaptive_avg_pool2d(x_2d, (4, 4)).reshape(B, -1)
-        soul = self.scale_fusion(torch.cat([p1, p2, p3], dim=1)).unsqueeze(1)
-        return self.norm(x + self.interaction_kan(torch.cat([x, soul.expand(-1, L, -1)], dim=-1)))
-
-class Native_KAN_CV_Block(nn.Module):
-    def __init__(self, d_model):
-        super().__init__()
-        self.ln1 = nn.LayerNorm(d_model)
-        self.local = AdaptiveHybridKANLayer(d_model, d_model)
-        self.ln2 = nn.LayerNorm(d_model)
-        self.pyramid = KANGlobalPyramidInteraction(d_model)
-        self.dropout = nn.Dropout(0.1)
+        self.use_checkpoint = use_checkpoint
+        # multiheadattention -> adaptivehybridkanlayer
+        # A: Attention (處理全域搬運) ---
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        
+        # B: Adaptive KAN (處理局部深度變換
+        self.norm2 = nn.LayerNorm(d_model)
+       
+        self.kan_ffn = AdaptiveHybridKANLayer(d_model, d_model) 
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        x = x + self.dropout(self.local(self.ln1(x)))
-        x = x + self.dropout(self.pyramid(self.ln2(x)))
+       
+        res = x
+        x_norm = self.norm1(x)
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
+        x = res + self.dropout(attn_out)
+        
+       
+        res = x
+        x_norm = self.norm2(x)
+        
+        if self.use_checkpoint and self.training:
+            # 關鍵：這裡會釋放 Spline 展開的巨大基函數矩陣
+            # 需要在反向傳播時重新計算，但能省下極大 VRAM
+            kan_out = checkpoint(self.kan_ffn, x_norm, use_reentrant=False)
+        else:
+            kan_out = self.kan_ffn(x_norm)
+            
+        x = res + self.dropout(kan_out)
         return x
 
-class Native_KAN_CV(nn.Module):
-    def __init__(self, d_model=128, depth=4, num_classes=100):
+class MemoryoptimizedHybridKANLanguageModel(nn.Module):
+    def __init__(self, vocab_size, d_model=128, depth=4, nhead=8, seq_len=128):
         super().__init__()
-        self.patch_embed = nn.Conv2d(3, d_model, kernel_size=4, stride=4)
-        self.blocks = nn.ModuleList([Native_KAN_CV_Block(d_model) for _ in range(depth)])
-        self.norm = nn.LayerNorm(d_model)
-        self.head = nn.Linear(d_model, num_classes)
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.pos_embed = nn.Parameter(torch.zeros(1, seq_len, d_model))
+        
+        # 堆疊混合區塊
+        self.blocks = nn.ModuleList([
+            MemoryEfficientHybridBlock(d_model, nhead) for _ in range(depth)
+        ])
+        
+        self.ln_f = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size)
 
     def forward(self, x):
-        x = self.patch_embed(x).flatten(2).transpose(1, 2)
-        for block in self.blocks: x = block(x)
-        return self.head(self.norm(x.mean(1)))
+        b, l = x.shape
+        x = self.embedding(x) + self.pos_embed[:, :l, :]
+        for block in self.blocks:
+            x = block(x)
+        return self.head(self.ln_f(x))
 
+def get_enwiki_data(batch_size=32, seq_len=128):
+    
+    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    tokenizer.pad_token = tokenizer.eos_token
+    
+    
+    def tokenize_function(examples):
+        return tokenizer(examples["text"], truncation=True, max_length=seq_len, padding="max_length")
+    
+    tokenized_datasets = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+    tokenized_datasets.set_format("torch")
+    
+    train_loader = DataLoader(tokenized_datasets, batch_size=batch_size, shuffle=True)
+    return train_loader, len(tokenizer)
 
+def count_parameters(model):
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters : {total_params / 1e6:.2f} M")
+    return total_params
 
-def get_dataloaders(batch_size=128):
-    tf_train = transforms.Compose([
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomCrop(32, padding=4),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
-    ])
-    tf_test = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
-    ])
-    train_set = torchvision.datasets.CIFAR100(root='./data', train=True, download=True, transform=tf_train)
-    test_set = torchvision.datasets.CIFAR100(root='./data', train=False, download=True, transform=tf_test)
-    return DataLoader(train_set, batch_size=batch_size, shuffle=True), DataLoader(test_set, batch_size=batch_size)
+def train_enwiki_final_v3(models_dict, train_loader, tokenizer, epochs=35):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    all_history = {}
+    
+    # 設定 Sequence Length (The expriement use 128 )
+    print("Start training (d_model=128)")
 
-def plot_final_results(histories):
-    plt.figure(figsize=(10, 6))
-    for name, h in histories.items():
-        plt.plot(h['test_acc'], label=f'{name} (Best: {max(h["test_acc"]):.4f})')
-    plt.axhline(y=0.445, color='gray', linestyle=':', label='ViT Baseline')
-    plt.title("CIFAR-100: KAN vs ViT Performance")
-    plt.xlabel("Epochs"); plt.ylabel("Accuracy"); plt.legend(); plt.grid(True)
+    for name, model in models_dict.items():
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        print(f"\n" + "="*50)
+        print(f"📦 正在優化訓練: {name}")
+        print(f"="*50)
+        
+        model.to(device)
+        
+        # 加強權重衰減，約束 B-Spline 曲線不要太極端 
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1.5e-4, weight_decay=0.05)
+        
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+        
+        criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
+        
+        hist = {'loss': [], 'ppl': [], 'grad_norm': []}
+        best_loss = float('inf')
+
+        for epoch in range(epochs):
+            model.train()
+            total_loss = 0
+            total_grad_norm = 0
+            
+            for i, batch in enumerate(train_loader):
+                inputs = batch['input_ids'].to(device)
+                targets = inputs.clone()
+                
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                
+                logits = outputs[:, :-1, :].contiguous().view(-1, outputs.size(-1))
+                labels = targets[:, 1:].contiguous().view(-1)
+                
+                loss = criterion(logits, labels)
+                loss.backward()
+                
+                
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                total_grad_norm += grad_norm.item()
+                
+                optimizer.step()
+                total_loss += loss.item()
+            
+            avg_loss = total_loss / len(train_loader)
+            avg_grad_norm = total_grad_norm / len(train_loader)
+            ppl = math.exp(avg_loss) if avg_loss < 10 else 999.9
+            
+            scheduler.step()
+            curr_lr = optimizer.param_groups[0]['lr']
+            
+            hist['loss'].append(avg_loss)
+            hist['ppl'].append(ppl)
+            hist['grad_norm'].append(avg_grad_norm)
+            
+            print(f"Epoch {epoch+1:02d} | PPL: {ppl:.2f} | Grad: {avg_grad_norm:.4f} | LR: {curr_lr:.2e}")
+
+            model.eval()
+            test_prompt = "The science of artificial intelligence is"
+            input_ids = tokenizer.encode(test_prompt, return_tensors="pt").to(device)
+            
+            with torch.no_grad():
+                generated = input_ids
+                for _ in range(30): # 預測長一點
+                    outputs = model(generated)
+                    logits = outputs[:, -1, :] / 0.8 # Temperature
+                    
+                    # lower the same patteron 
+                    for token_id in set(generated[0].tolist()):
+                        logits[0, token_id] /= 1.2
+                    
+                    probs = torch.softmax(logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                    generated = torch.cat([generated, next_token], dim=1)
+                
+                print(f"🔮 [隨機採樣預測] -> {tokenizer.decode(generated[0])}")
+
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                torch.save(model.state_dict(), f"v6_best_{name}.pth")
+        
+        all_history[name] = hist
+        model.to('cpu')
+    
+    return all_history
+
+import matplotlib.pyplot as plt
+
+def plot_enwiki_full_results(all_history):
+    # 設定圖表風格
+    plt.style.use('seaborn-v0_8-whitegrid')
+    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+    
+    # 1. Loss 曲線
+    for name, h in all_history.items():
+        axes[0].plot(h['loss'], label=name, marker='o', markersize=4)
+    axes[0].set_title("Training Loss")
+    axes[0].set_xlabel("Epoch")
+    axes[0].legend()
+    
+    # 2. PPL 曲線 (用對數座標看更精準)
+    for name, h in all_history.items():
+        axes[1].plot(h['ppl'], label=name, marker='s', markersize=4)
+    axes[1].set_title("Perplexity (PPL)")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_yscale('log')
+    axes[1].legend()
+    
+    
+    for name, h in all_history.items():
+        if 'grad_norm' in h:
+            axes[2].plot(h['grad_norm'], label=name, marker='^', markersize=4)
+            axes[2].set_title("Average Gradient Norm")
+        else:
+            
+            key = 'mem' if 'mem' in h else 'loss'
+            axes[2].plot(h[key], label=f"{name} ({key})")
+            axes[2].set_title(f"Training {key}")
+            
+    axes[2].set_xlabel("Epoch")
+    axes[2].legend()
+    
+    plt.tight_layout()
+    plt.savefig("KAN_vs_Transformer_Analysis.png")
     plt.show()
 
-
-
-train_loader, test_loader = get_dataloaders()
-
-
-contestants = {
-    "ViT_Tiny": timm.create_model('vit_tiny_patch4_32', num_classes=100, embed_dim=128, depth=4, num_heads=4),
-    "Native_KAN_Gold(128)": Native_KAN_CV(d_model=128, depth=4),
-    "Native_KAN_Middle(63)":Native_KAN_CV(d_model=64,depth=4),
-    "Native_KAN_Slim(48)": Native_KAN_CV(d_model=48,depth=4),
-    "Native_KAN_Tiny(32)": Native_KAN_CV(d_model=24,depth=4),
+#main
+train_loader, vocab_size = get_enwiki_data()
+enwiki_models = {
+    "Transformer_Baseline": BaselineTransformer(vocab_size, d_model=128),
+    
+    "MemoryoptimizedHybridKANLanguageModel":MemoryoptimizedHybridKANLanguageModel(vocab_size,d_model=128)
 }
+tokenizer = AutoTokenizer.from_pretrained("gpt2")
 
+enwiki_results = train_enwiki_final_v3(enwiki_models,train_loader,tokenizer, epochs=35)
 
-results = train_with_val_safe(contestants, train_loader, test_loader, epochs=30)
-
-# 4. 生成圖表
-plot_final_results(results)
+plot_enwiki_full_results(enwiki_results)
